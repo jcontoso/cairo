@@ -1,6 +1,8 @@
 /* -*- Mode: c; tab-width: 8; c-basic-offset: 4; indent-tabs-mode: t; -*- */
 /* cairo - a vector graphics library with display and print output
  *
+/* cairo - a vector graphics library with display and print output
+ *
  * Copyright © 2002 University of Southern California
  * Copyright © 2005 Red Hat, Inc.
  *
@@ -2670,15 +2672,16 @@ composite_one_color_glyph (cairo_surface_t       *surface,
         cairo_matrix_init_translate (&matrix, - x, - y);
 	cairo_matrix_scale (&matrix, x_scale, y_scale);
         cairo_pattern_set_matrix (pattern, &matrix);
-	if (op == CAIRO_OPERATOR_SOURCE || op == CAIRO_OPERATOR_CLEAR || !has_color)
-	  status = surface->backend->mask (surface, op, pattern, pattern, clip);
-	else
-	  status = surface->backend->paint (surface, op, pattern, clip);
+        if (op == CAIRO_OPERATOR_SOURCE || op == CAIRO_OPERATOR_CLEAR || !has_color)
+          status = _cairo_surface_mask (surface, op, pattern, pattern, clip);
+        else
+          status = _cairo_surface_paint (surface, op, pattern, clip);
         cairo_pattern_destroy (pattern);
     }
 
     return status;
 }
+
 
 static cairo_int_status_t
 composite_color_glyphs (cairo_surface_t             *surface,
