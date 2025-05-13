@@ -65,6 +65,12 @@
 #endif
 
 #define IS_EMPTY(s) ((s)->extents.width == 0 || (s)->extents.height == 0)
+#if MAC_OS_X_VERSION_MIN_REQUIRED < 1080
+#define FONT_ORIENTATION_HORIZONTAL kCTFontHorizontalOrientation
+#else
+#define FONT_ORIENTATION_HORIZONTAL kCTFontOrientationHorizontal
+#endif
+
 
 /**
  * SECTION:cairo-quartz
@@ -2016,19 +2022,29 @@ _cairo_quartz_cg_glyphs (const cairo_compositor_t *compositor,
 			 cairo_bool_t overlap)
 {
     CGAffineTransform textTransform, invTextTransform;
-    CGGlyph glyphs_static[CAIRO_STACK_ARRAY_LENGTH (CGSize)];
-    CGSize cg_advances_static[CAIRO_STACK_ARRAY_LENGTH (CGSize)];
-    CGGlyph *cg_glyphs = &glyphs_static[0];
+#if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
+    CGGlyph glyphs_static[CAIRO_STACK_ARRAY_LENGTH (CGGlyph)];
+    CGPoint cg_positions_static[CAIRO_STACK_ARRAY_LENGTH (CGPoint)];
     CGSize *cg_advances = &cg_advances_static[0];
     COMPILE_TIME_ASSERT (sizeof (CGGlyph) <= sizeof (CGSize));
-
+#else
+    CGGlyph glyphs_static[CAIRO_STACK_ARRAY_LENGTH (CGSize)];
+    CGSize cg_advances_static[CAIRO_STACK_ARRAY_LENGTH (CGSize)];
+    CGPoint *cg_positions = &cg_positions_static[0];
+#endif
+    CGGlyph *cg_glyphs = &glyphs_static[0];
+    
     cairo_quartz_drawing_state_t state;
     cairo_int_status_t rv = CAIRO_INT_STATUS_UNSUPPORTED;
+#if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
+    CGPoint origin;
+    CTFontRef ctFont = NULL;
+#else
     cairo_quartz_float_t xprev, yprev;
-    int i;
     CGFontRef cgfref = NULL;
-
-    cairo_bool_t didForceFontSmoothing = FALSE;
+#endif
+	int i;
+	cairo_bool_t didForceFontSmoothing = FALSE;
 
     if (cairo_scaled_font_get_type (scaled_font) != CAIRO_FONT_TYPE_QUARTZ)
 	return CAIRO_INT_STATUS_UNSUPPORTED;
@@ -2045,45 +2061,30 @@ _cairo_quartz_cg_glyphs (const cairo_compositor_t *compositor,
     }
 
     /* this doesn't addref */
+#if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
+	ctFont = _cairo_quartz_scaled_font_get_ct_font (scaled_font);
+#else
     cgfref = _cairo_quartz_scaled_font_get_cg_font_ref (scaled_font);
-    CGContextSetFont (state.cgMaskContext, cgfref);
-    CGContextSetFontSize (state.cgMaskContext, 1.0);
-
-    switch (scaled_font->options.antialias) {
-	case CAIRO_ANTIALIAS_SUBPIXEL:
-	case CAIRO_ANTIALIAS_BEST:
-	    CGContextSetShouldAntialias (state.cgMaskContext, TRUE);
-	    CGContextSetShouldSmoothFonts (state.cgMaskContext, TRUE);
-	    if (CGContextSetAllowsFontSmoothingPtr &&
-		!CGContextGetAllowsFontSmoothingPtr (state.cgMaskContext))
-	    {
-		didForceFontSmoothing = TRUE;
-		CGContextSetAllowsFontSmoothingPtr (state.cgMaskContext, TRUE);
-	    }
-	    break;
-	case CAIRO_ANTIALIAS_NONE:
-	    CGContextSetShouldAntialias (state.cgMaskContext, FALSE);
-	    break;
-	case CAIRO_ANTIALIAS_GRAY:
-	case CAIRO_ANTIALIAS_GOOD:
-	case CAIRO_ANTIALIAS_FAST:
-	    CGContextSetShouldAntialias (state.cgMaskContext, TRUE);
-	    CGContextSetShouldSmoothFonts (state.cgMaskContext, FALSE);
-	    break;
-	case CAIRO_ANTIALIAS_DEFAULT:
-	    /* Don't do anything */
-	    break;
-    }
+#endif
+    _cairo_quartz_set_antialiasing (state.cgMaskContext, scaled_font->options.antialias);
 
     if (num_glyphs > ARRAY_LENGTH (glyphs_static)) {
+#if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
+	cg_glyphs = (CGGlyph*) _cairo_malloc_ab (num_glyphs, sizeof (CGGlyph) + sizeof (CGPoint));
+#else
 	cg_glyphs = (CGGlyph*) _cairo_malloc_ab (num_glyphs, sizeof (CGGlyph) + sizeof (CGSize));
+#endif	
 	if (unlikely (cg_glyphs == NULL)) {
 	    rv = _cairo_error (CAIRO_STATUS_NO_MEMORY);
 	    goto BAIL;
 	}
 
+#if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
+	cg_positions = (CGPoint*) (cg_glyphs + num_glyphs);
+#else
 	cg_advances = (CGSize*) (cg_glyphs + num_glyphs);
-    }
+#endif   
+	}
 
     /* scale(1,-1) * scaled_font->scale */
     textTransform = CGAffineTransformMake (scaled_font->scale.xx,
@@ -2098,7 +2099,16 @@ _cairo_quartz_cg_glyphs (const cairo_compositor_t *compositor,
 					      scaled_font->scale_inverse.xy,
 					      -scaled_font->scale_inverse.yy,
 					      0.0, 0.0);
-
+#if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
+    origin = CGPointMake (glyphs[0].x, glyphs[0].y);
+    for (i = 0; i < num_glyphs; ++i)
+    {
+	cg_glyphs[i] = glyphs[i].index;
+	cg_positions[i] = CGPointMake (glyphs[i].x - origin.x, glyphs[i].y - origin.y);
+	cg_positions[i] = CGPointApplyAffineTransform (cg_positions[i], invTextTransform);
+    }
+	CGContextTranslateCTM (state.cgMaskContext, origin.x, origin.y);
+#else
     CGContextSetTextPosition (state.cgMaskContext, 0.0, 0.0);
     CGContextSetTextMatrix (state.cgMaskContext, CGAffineTransformIdentity);
 
@@ -2117,19 +2127,26 @@ _cairo_quartz_cg_glyphs (const cairo_compositor_t *compositor,
 	xprev = xf;
 	yprev = yf;
     }
+	CGContextTranslateCTM (state.cgMaskContext, glyphs[0].x, glyphs[0].y);
+#endif
 
     /* Translate to the first glyph's position before drawing */
-    CGContextTranslateCTM (state.cgMaskContext, glyphs[0].x, glyphs[0].y);
     CGContextConcatCTM (state.cgMaskContext, textTransform);
 
+#if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
+	CTFontDrawGlyphs (ctFont, cg_glyphs, cg_positions, num_glyphs, state.cgMaskContext);
+#else
     CGContextShowGlyphsWithAdvances (state.cgMaskContext,
 				     cg_glyphs,
 				     cg_advances,
 				     num_glyphs);
-
+#endif
     CGContextConcatCTM (state.cgMaskContext, invTextTransform);
+#if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
+    CGContextTranslateCTM (state.cgMaskContext, -origin.x, -origin.y);
+#else
     CGContextTranslateCTM (state.cgMaskContext, -glyphs[0].x, -glyphs[0].y);
-
+#endif
     if (state.action != DO_DIRECT)
 	_cairo_quartz_draw_source (&state, extents->op);
 
