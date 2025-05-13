@@ -2065,6 +2065,8 @@ _cairo_quartz_cg_glyphs (const cairo_compositor_t *compositor,
 	ctFont = _cairo_quartz_scaled_font_get_ct_font (scaled_font);
 #else
     cgfref = _cairo_quartz_scaled_font_get_cg_font_ref (scaled_font);
+    CGContextSetFont (state.cgMaskContext, cgfref);
+    CGContextSetFontSize (state.cgMaskContext, 1.0);
 #endif
     _cairo_quartz_set_antialiasing (state.cgMaskContext, scaled_font->options.antialias);
 
