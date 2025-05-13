@@ -119,8 +119,10 @@ static const CGFloat font_scale = 1.0;
 
 #if MAC_OS_X_VERSION_MIN_REQUIRED < 1080
 #define FONT_ORIENTATION_HORIZONTAL kCTFontHorizontalOrientation
+#define FONT_COLOR_GLYPHS kCTFontTraitColorGlyphs
 #else
 #define FONT_ORIENTATION_HORIZONTAL kCTFontOrientationHorizontal
+#define FONT_COLOR_GLYPHS kCTFontColorGlyphsTrait
 #endif
 
 static void
@@ -743,21 +745,30 @@ _cairo_quartz_init_glyph_path (cairo_quartz_scaled_font_t *font,
 
     return CAIRO_STATUS_SUCCESS;
 }
+static cairo_bool_t
+_cairo_quartz_font_has_color_glyphs (void *abstract_font)
+{
+#if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
+	cairo_quartz_scaled_font_t *face = (cairo_quartz_scaled_font_t*)abstract_font;
+    CTFontSymbolicTraits traits = CTFontGetSymbolicTraits (face->ctFont);
+    return traits & FONT_COLOR_GLYPHS;
+#else
+	return 0
+#endif    
+}
 
 static cairo_int_status_t
 _cairo_quartz_init_glyph_surface (cairo_quartz_scaled_font_t *font,
-				  cairo_scaled_glyph_t *scaled_glyph)
+				  cairo_scaled_glyph_t *scaled_glyph,
+				  cairo_scaled_glyph_info_t info,
+				 const cairo_color_t *fg_color)
 {
     cairo_int_status_t status = CAIRO_STATUS_SUCCESS;
-
 #if !CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
 	cairo_quartz_font_face_t *font_face = _cairo_quartz_scaled_to_face(font);
 #endif
-
     cairo_image_surface_t *surface = NULL;
-
     CGGlyph glyph = _cairo_quartz_scaled_glyph_index (scaled_glyph);
-    
 #if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
 	cairo_text_extents_t metrics = scaled_glyph->fs_metrics;
     CGRect bbox = CGRectMake (metrics.x_bearing, -(metrics.y_bearing + metrics.height),
@@ -769,10 +780,11 @@ _cairo_quartz_init_glyph_surface (cairo_quartz_scaled_font_t *font,
     CGContextRef cgContext = NULL;
 #endif 
     double width, height;
-
     CGAffineTransform textMatrix;
     CGRect glyphRect, glyphRectInt;
     CGPoint glyphOrigin;
+    cairo_bool_t is_color = info & CAIRO_SCALED_GLYPH_INFO_COLOR_SURFACE;
+    cairo_format_t format =  is_color ? CAIRO_FORMAT_ARGB32 : CAIRO_FORMAT_A8;
 
 #if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT && defined(DEBUG)
     fprintf (stderr, "[0x%04x] bearing: %f %f width %f height %f advances %f %f\n",
@@ -797,6 +809,19 @@ _cairo_quartz_init_glyph_surface (cairo_quartz_scaled_font_t *font,
 					 surface);
 	return CAIRO_STATUS_SUCCESS;
     }
+
+/* Note: Certain opentype color fonts have the ability to provide a
+ * mixture of color and not-color glyphs. The Core Text API doesn't
+ * expose a way to query individual glyphs and at the level that that
+ * API is written it's not supposed to matter. The following code will
+ * cheerfully render any glyph requested onto the image surface. If
+ * the font is capable of color and
+ * COLOR_SCALED_GLYPH_INFO_COLOR_SURFACE is set then you get back a
+ * CAIRO_FORMAT_ARGB32 surface. If a foreground color is provided then
+ * the glyph will be drawn in that color, otherwise it will be black.
+ */
+    if (unlikely (is_color && ! _cairo_quartz_font_has_color_glyphs (font)))
+	return CAIRO_INT_STATUS_UNSUPPORTED;
 
 #if !CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
     if (!CGFontGetGlyphAdvancesPtr (font_face->cgFont, &glyph, 1, &advance) ||
@@ -841,57 +866,65 @@ _cairo_quartz_init_glyph_surface (cairo_quartz_scaled_font_t *font,
     width = glyphRectInt.size.width;
     height = glyphRectInt.size.height;
 
-    surface = (cairo_image_surface_t*) cairo_image_surface_create (CAIRO_FORMAT_A8, width, height);
+    surface = (cairo_image_surface_t*) cairo_image_surface_create (format, width, height);
     if (surface->base.status)
 	return surface->base.status;
 
     if (surface->width != 0 && surface->height != 0) {
+		CGColorSpaceRef colorspace = is_color ? CGColorSpaceCreateDeviceRGB () : NULL;
+		CGBitmapInfo bitinfo = is_color ? kCGBitmapByteOrder32Host | kCGImageAlphaPremultipliedFirst : kCGImageAlphaOnly;
 #if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
-	CGContextRef cgContext = CGBitmapContextCreate (surface->data,	
+		CGContextRef cgContext = CGBitmapContextCreate (surface->data,	
 							surface->width,
 							surface->height,
 							8,
 							surface->stride,
-							NULL,
-							kCGImageAlphaOnly);
+							colorspace,
+							bitinfo);
 #else
-	cgContext = CGBitmapContextCreate (surface->data,
-					   surface->width,
-					   surface->height,
-					   8,
-					   surface->stride,
-					   NULL,
-					   kCGImageAlphaOnly);
+		cgContext = CGBitmapContextCreate (surface->data,
+						surface->width,
+						surface->height,
+						8,
+						surface->stride,
+						colorspace,
+						bitinfo);
 #endif	
 
-	if (cgContext == NULL) {
-	    cairo_surface_destroy (&surface->base);
-	    return _cairo_error (CAIRO_STATUS_NO_MEMORY);
-	}
+		if (cgContext == NULL) {
+			cairo_surface_destroy (&surface->base);
+			return _cairo_error (CAIRO_STATUS_NO_MEMORY);
+		}
 
 #if !CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
-	CGContextSetFont (cgContext, font_face->cgFont);
-	CGContextSetFontSize (cgContext, 1.0);
-	CGContextSetTextMatrix (cgContext, textMatrix);
+		CGContextSetFont (cgContext, font_face->cgFont);
+		CGContextSetFontSize (cgContext, 1.0);
+		CGContextSetTextMatrix (cgContext, textMatrix);
 #endif
-
-	_cairo_quartz_set_antialiasing (cgContext, font->base.options.antialias);
-	CGContextSetAlpha (cgContext, 1.0);
+		if (fg_color)
+			CGContextSetRGBFillColor (cgContext, fg_color->red, fg_color->green, fg_color->blue, fg_color->alpha);
+		_cairo_quartz_set_antialiasing (cgContext, font->base.options.antialias);
+		CGContextSetAlpha (cgContext, 1.0);
 #if CAIRO_HAS_QUARTZ_CORE_TEXT_FONT
-	CGContextTranslateCTM (cgContext, -glyphOrigin.x, -glyphOrigin.y);
-	CGContextConcatCTM (cgContext, textMatrix);
-	CTFontDrawGlyphs (font->ctFont, &glyph, &CGPointZero, 1, cgContext);
+		CGContextTranslateCTM (cgContext, -glyphOrigin.x, -glyphOrigin.y);
+		CGContextConcatCTM (cgContext, textMatrix);
+		CTFontDrawGlyphs (font->ctFont, &glyph, &CGPointZero, 1, cgContext);
 #else
-	CGContextShowGlyphsAtPoint (cgContext, - glyphOrigin.x, - glyphOrigin.y, &glyph, 1);
+		CGContextShowGlyphsAtPoint (cgContext, - glyphOrigin.x, - glyphOrigin.y, &glyph, 1);
 #endif
-	CGContextRelease (cgContext);
-    }
+		CGContextRelease (cgContext);
+		CGColorSpaceRelease (colorspace);
+   }
 
     cairo_surface_set_device_offset (&surface->base,
 				     - glyphOrigin.x,
 				     height + glyphOrigin.y);
+    cairo_surface_mark_dirty (&surface->base);
 
-    _cairo_scaled_glyph_set_surface (scaled_glyph, &font->base, surface);
+    if (is_color)
+		_cairo_scaled_glyph_set_color_surface (scaled_glyph, &font->base, surface, fg_color != NULL);
+    else
+		_cairo_scaled_glyph_set_surface (scaled_glyph, &font->base, surface);
 
     return status;
 }
@@ -911,8 +944,10 @@ _cairo_quartz_scaled_glyph_init (void *abstract_font,
     if (!status && (info & CAIRO_SCALED_GLYPH_INFO_PATH))
 	status = _cairo_quartz_init_glyph_path (font, scaled_glyph);
 
-    if (!status && (info & CAIRO_SCALED_GLYPH_INFO_SURFACE))
-	status = _cairo_quartz_init_glyph_surface (font, scaled_glyph);
+    if (!status && (info & (CAIRO_SCALED_GLYPH_INFO_SURFACE |
+			    CAIRO_SCALED_GLYPH_INFO_COLOR_SURFACE )))
+	status = _cairo_quartz_init_glyph_surface (font, scaled_glyph,
+						   info, foreground_color);
 
     return status;
 }
@@ -987,7 +1022,11 @@ static const cairo_scaled_font_backend_t _cairo_quartz_scaled_font_backend = {
     _cairo_quartz_ucs4_to_index,
     _cairo_quartz_load_truetype_table,
     NULL, /*index_to_ucs4*/
-}; /* is_synthetic, index_to_glyph_name, load_type1_data, has_color_glyphs */
+    NULL, /* is_synthetic */
+    NULL, /* index_to_glyph_name */
+    NULL, /* load_type1_data */
+    _cairo_quartz_font_has_color_glyphs
+};
 
 /*
  * private methods that the quartz surface uses
